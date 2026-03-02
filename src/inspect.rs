@@ -6,6 +6,8 @@ pub struct FileInfo {
     pub size: Option<u64>,
     pub supports_range: bool,
     pub suggested_filename: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
 
 impl FileInfo {
@@ -40,7 +42,19 @@ fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Op
     None
 }
 
-pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> { 
+fn extract_etag(headers: &header::HeaderMap) -> Option<String> {
+    headers.get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+fn extract_last_modified(headers: &header::HeaderMap) -> Option<String> {
+    headers.get(header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
     let resp = client
         .get(url)
         .header(header::RANGE, "bytes=0-0")
@@ -50,6 +64,8 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
 
     let status = resp.status();
     let suggested_filename = filename_from_content_disposition(resp.headers());
+    let etag = extract_etag(resp.headers());
+    let last_modified = extract_last_modified(resp.headers());
 
     if status == StatusCode::PARTIAL_CONTENT {
         let size = extract_size_from_content_range(resp.headers())
@@ -57,7 +73,9 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: true,
-            suggested_filename: suggested_filename.clone(),
+            suggested_filename,
+            etag,
+            last_modified,
         });
     }
 
@@ -66,7 +84,9 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: false,
-            suggested_filename: suggested_filename.clone(),
+            suggested_filename,
+            etag,
+            last_modified,
         });
     }
 
@@ -75,7 +95,9 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: false,
-            suggested_filename: suggested_filename.clone(),
+            suggested_filename,
+            etag,
+            last_modified,
         });
     }
 
@@ -104,10 +126,15 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .map(|v| v.eq_ignore_ascii_case("bytes"))
         .unwrap_or(false);
 
+    let head_etag = extract_etag(head_resp.headers());
+    let head_last_modified = extract_last_modified(head_resp.headers());
+
     Ok(FileInfo {
         size,
         supports_range,
         suggested_filename,
+        etag: head_etag,
+        last_modified: head_last_modified,
     })
 }
 
@@ -119,7 +146,6 @@ fn extract_content_length(headers: &header::HeaderMap) -> Option<u64> {
         .filter(|&len| len > 0)
 }
 
-/// Parse `Content-Range: bytes 0-0/12345` → Some(12345)
 fn extract_size_from_content_range(headers: &header::HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_RANGE)
@@ -188,14 +214,14 @@ mod tests {
     }
 
     #[test]
-fn test_file_info_can_chunk() {
-    let info: FileInfo = FileInfo { size: Some(1024), supports_range: true, suggested_filename: None };
-    assert!(info.can_chunk());
+    fn test_file_info_can_chunk() {
+        let info = FileInfo { size: Some(1024), supports_range: true, suggested_filename: None, etag: None, last_modified: None };
+        assert!(info.can_chunk());
 
-    let info: FileInfo = FileInfo { size: None, supports_range: true, suggested_filename: None };
-    assert!(!info.can_chunk());
+        let info = FileInfo { size: None, supports_range: true, suggested_filename: None, etag: None, last_modified: None };
+        assert!(!info.can_chunk());
 
-    let info: FileInfo = FileInfo { size: Some(1024), supports_range: false, suggested_filename: None };
-    assert!(!info.can_chunk());
+        let info = FileInfo { size: Some(1024), supports_range: false, suggested_filename: None, etag: None, last_modified: None };
+        assert!(!info.can_chunk());
     }
 }
