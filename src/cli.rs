@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -9,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use crate::chunk::Chunk;
 use crate::inspect;
 use crate::parallel;
-use crate::resume::ResumeMetadata;
 use crate::retry::RetryConfig;
 
 static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -32,6 +30,75 @@ fn shared_config() -> &'static crate::config::Config {
     SHARED_CONFIG.get_or_init(crate::config::Config::load)
 }
 
+// ── Streaming Resume Helpers ───────────────────────────────────────
+
+/// Describes what the streaming download should do after the initial response.
+#[derive(Debug, PartialEq)]
+pub enum ResumeAction {
+    /// Server confirmed the range — append to existing .part file from this offset.
+    Resume(u64),
+    /// Response is unusable for resume — must drop response and re-request.
+    Restart,
+    /// No prior partial state — consume this response from the start.
+    Fresh,
+    /// Response indicates failure — do not consume body.
+    Fail(reqwest::StatusCode),
+}
+
+pub fn resolve_resume_action(
+    status: reqwest::StatusCode,
+    existing_bytes: u64,
+    content_range: Option<&str>,
+) -> ResumeAction {
+    if existing_bytes == 0 {
+        if status.is_success() {
+            return ResumeAction::Fresh;
+        } else {
+            return ResumeAction::Fail(status);
+        }
+    }
+
+    // existing_bytes > 0: we sent a Range header
+    match status {
+        reqwest::StatusCode::PARTIAL_CONTENT => {
+            if let Some(cr) = content_range {
+                let expected_prefix = format!("bytes {}-", existing_bytes);
+                if cr.starts_with(&expected_prefix) {
+                    ResumeAction::Resume(existing_bytes)
+                } else {
+                    ResumeAction::Restart
+                }
+            } else {
+                // 206 without Content-Range — optimistic resume
+                ResumeAction::Resume(existing_bytes)
+            }
+        }
+        reqwest::StatusCode::OK => {
+            // Server ignored Range header entirely
+            ResumeAction::Restart
+        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
+            ResumeAction::Restart
+        }
+        _ => {
+            ResumeAction::Fail(status)
+        }
+    }
+}
+
+pub fn build_streaming_request(
+    client: &reqwest::Client,
+    url: &str,
+    existing_bytes: u64,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if existing_bytes > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_bytes));
+    }
+    req
+}
+
+// ── Main Download Entry Point ──────────────────────────────────────
 
 pub async fn run_download(
     url: String,
@@ -91,13 +158,13 @@ pub async fn run_download(
                     if !quiet {
                         let secs = start_time.elapsed().as_secs_f64();
                         let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
-                        eprintln!("  ✅ Download complete: {}", output_path);
+                        eprintln!("  \u{2705} Download complete: {}", output_path);
                         eprintln!("  {} in {:.1}s ({})", format_bytes(bytes), secs, format_speed(avg));
                     }
                     Ok(())
                 }
                 Err(e) => {
-                    if !quiet { eprintln!("  ❌ Download failed."); }
+                    if !quiet { eprintln!("  \u{274d} Download failed."); }
                     Err(e)
                 }
             };
@@ -143,7 +210,7 @@ pub async fn run_download(
         let is_complete = downloaded >= total;
 
         {
-            let mut lp = last_print.lock().unwrap();
+            let mut lp = last_print.lock().unwrap_or_else(|p| p.into_inner());
             if !is_complete && now.duration_since(*lp) < Duration::from_millis(100) {
                 return;
             }
@@ -151,7 +218,7 @@ pub async fn run_download(
         }
 
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        let mut samples = speed_samples.lock().unwrap();
+        let mut samples = speed_samples.lock().unwrap_or_else(|p| p.into_inner());
         samples.push_back((elapsed_ms, downloaded));
 
         while samples.len() > 1 && elapsed_ms - samples.front().unwrap().0 > 3000 {
@@ -172,14 +239,24 @@ pub async fn run_download(
     };
 
     let retry_config = RetryConfig {
-    max_retries: shared_config().max_retries,
-    ..RetryConfig::default()
-    }; 
+        max_retries: shared_config().max_retries,
+        ..RetryConfig::default()
+    };
+
+    let ctx = parallel::ParallelDownloadCtx {
+        client,
+        url: &url,
+        output_path: &output_path,
+        file_size,
+        chunks: &chunks,
+        retry_config: &retry_config,
+        cancel,
+        etag: info.etag.clone(),
+        last_modified: info.last_modified.clone(),
+    };
 
     let download_result = parallel::download_parallel(
-        client, &url, &output_path, file_size, &chunks,
-        &retry_config, Some(progress_callback), cancel,
-        info.etag.clone(), info.last_modified.clone(),
+        &ctx, Some(progress_callback),
     ).await;
 
     if !quiet {
@@ -191,7 +268,7 @@ pub async fn run_download(
             if !quiet {
                 let secs = start_time.elapsed().as_secs_f64();
                 let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
-                eprintln!("  ✅ Download complete: {}", output_path);
+                eprintln!("  \u{2705} Download complete: {}", output_path);
                 eprintln!("  {} in {:.1}s ({})",
                     format_bytes(bytes), secs, format_speed(avg),
                 );
@@ -201,7 +278,7 @@ pub async fn run_download(
 
         Err(e) => {
             if !quiet {
-                eprintln!("  ❌ Download failed.");
+                eprintln!("  \u{274d} Download failed.");
                 eprintln!("  Progress saved. Resume by running the same command again.");
             }
             Err(e)
@@ -224,29 +301,64 @@ async fn download_streaming(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let mut req = client.get(url); 
+    // Phase 1: Build and send (possibly ranged) request
+    let resp = build_streaming_request(client, url, existing_bytes)
+        .send()
+        .await
+        .context("GET request failed")?;
 
-    let resp = req.send().await.context("GET request failed")?;
     let status = resp.status();
+    let content_range = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
 
-    let (resume_offset, append) = if existing_bytes > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
-        if !quiet {
-            eprintln!("  Resuming from {}", format_bytes_compact(existing_bytes));
+    // Phase 2: Decide resume/restart/fresh/fail
+    let (resume_offset, append, resp) = match resolve_resume_action(
+        status,
+        existing_bytes,
+        content_range.as_deref(),
+    ) {
+        ResumeAction::Resume(offset) => {
+            if !quiet {
+                eprintln!("  Resuming from {}", format_bytes_compact(offset));
+            }
+            (offset, true, resp)
         }
-        (existing_bytes, true)
-    } else if status.is_success() {
-        if existing_bytes > 0 && !quiet {
-            eprintln!("  Server ignored range request, restarting from zero");
+        ResumeAction::Restart => {
+            // Drop the unusable response and issue a fresh non-range GET
+            drop(resp);
+            if existing_bytes > 0 && !quiet {
+                eprintln!("  Server response unusable for resume, restarting from zero");
+            }
+            let fresh_resp = client
+                .get(url)
+                .send()
+                .await
+                .context("Fresh GET request failed")?;
+            if !fresh_resp.status().is_success() {
+                anyhow::bail!(
+                    "Restart request failed with status {} {}",
+                    fresh_resp.status().as_u16(),
+                    fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
+                );
+            }
+            (0u64, false, fresh_resp)
         }
-        (0, false)
-    } else {
-        anyhow::bail!(
-            "Server returned {} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("Unknown")
-        );
+        ResumeAction::Fresh => {
+            (0u64, false, resp)
+        }
+        ResumeAction::Fail(code) => {
+            anyhow::bail!(
+                "Server returned {} {}",
+                code.as_u16(),
+                code.canonical_reason().unwrap_or("Unknown"),
+            );
+        }
     };
 
+    // Phase 3: Open file and stream body
     let file = if append {
         tokio::fs::OpenOptions::new()
             .append(true)
@@ -349,7 +461,7 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
         .parent()
         .unwrap_or(std::path::Path::new(""));
 
-    eprintln!("  ⚠ File already exists: {}", path);
+    eprintln!("  \u{26a0} File already exists: {}", path);
     eprintln!();
     eprintln!("  1) Overwrite");
     eprintln!("  2) Rename");
@@ -422,8 +534,15 @@ pub fn percent_decode(input: &str) -> String {
                         continue;
                     }
                 }
+                // Failed decode — push all three bytes back
+                bytes.push(b'%');
+                bytes.push(h);
+                bytes.push(l);
+            } else {
+                // Incomplete sequence — push what we have
+                bytes.push(b'%');
+                if let Some(h) = hi { bytes.push(h); }
             }
-            bytes.push(b'%');
         } else {
             bytes.push(b);
         }
@@ -448,7 +567,7 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
-// ── Progress Display ───────────────────────────────────────────────
+// ── Progress Display ────────────────────────────────────────────────
 
 fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
     if total == 0 { return; }
@@ -460,7 +579,7 @@ fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
     let filled = (pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
     eprint!("\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {} | {}",
-        pct, "█".repeat(filled), "░".repeat(empty),
+        pct, "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),
         format_bytes_compact(downloaded), format_bytes_compact(total), speed, eta,
     );
 }
@@ -501,7 +620,7 @@ fn format_bytes_compact(bytes: u64) -> String {
     else { format!("{} B", bytes) }
 }
 
-// ── Tests ──────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -529,5 +648,134 @@ mod tests {
         let total: u64 = chunks.iter().map(|c| c.end - c.start + 1).sum();
         assert_eq!(total, 1003);
         for i in 1..chunks.len() { assert_eq!(chunks[i].start, chunks[i-1].end + 1); }
+    }
+
+    // ── Streaming resume helper tests ──
+
+    #[test]
+    fn test_build_request_no_existing_bytes() {
+        let client = reqwest::Client::new();
+        let req = build_streaming_request(&client, "https://example.com/file.bin", 0)
+            .build()
+            .unwrap();
+        assert!(req.headers().get(reqwest::header::RANGE).is_none());
+    }
+
+    #[test]
+    fn test_build_request_with_existing_bytes() {
+        let client = reqwest::Client::new();
+        let req = build_streaming_request(&client, "https://example.com/file.bin", 4096)
+            .build()
+            .unwrap();
+        let range = req.headers().get(reqwest::header::RANGE).unwrap();
+        assert_eq!(range.to_str().unwrap(), "bytes=4096-");
+    }
+
+    #[test]
+    fn test_resume_action_206_valid_content_range() {
+        assert_eq!(
+            resolve_resume_action(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                4096,
+                Some("bytes 4096-8191/8192"),
+            ),
+            ResumeAction::Resume(4096),
+        );
+    }
+
+    #[test]
+    fn test_resume_action_206_mismatched_content_range() {
+        assert_eq!(
+            resolve_resume_action(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                4096,
+                Some("bytes 0-8191/8192"),
+            ),
+            ResumeAction::Restart,
+        );
+    }
+
+    #[test]
+    fn test_resume_action_206_without_content_range() {
+        assert_eq!(
+            resolve_resume_action(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                4096,
+                None,
+            ),
+            ResumeAction::Resume(4096),
+        );
+    }
+
+    #[test]
+    fn test_resume_action_200_ignores_range() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::OK, 4096, None),
+            ResumeAction::Restart,
+        );
+    }
+
+    #[test]
+    fn test_resume_action_no_existing_bytes_success() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::OK, 0, None),
+            ResumeAction::Fresh,
+        );
+    }
+
+    #[test]
+    fn test_resume_action_no_existing_bytes_failure() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::NOT_FOUND, 0, None),
+            ResumeAction::Fail(reqwest::StatusCode::NOT_FOUND),
+        );
+    }
+
+    #[test]
+    fn test_resume_action_416_range_not_satisfiable() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::RANGE_NOT_SATISFIABLE, 99999, None),
+            ResumeAction::Restart,
+        );
+    }
+
+    #[test]
+    fn test_resume_action_403_with_existing_bytes() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::FORBIDDEN, 4096, None),
+            ResumeAction::Fail(reqwest::StatusCode::FORBIDDEN),
+        );
+    }
+
+    #[test]
+    fn test_resume_action_500_with_existing_bytes() {
+        assert_eq!(
+            resolve_resume_action(reqwest::StatusCode::INTERNAL_SERVER_ERROR, 4096, None),
+            ResumeAction::Fail(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        );
+    }
+
+    // ── percent_decode fix tests ──
+
+    #[test]
+    fn test_percent_decode_valid() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn test_percent_decode_invalid_hex() {
+        // %GH is not valid hex — all three bytes should be preserved
+        assert_eq!(percent_decode("test%GHvalue"), "test%GHvalue");
+    }
+
+    #[test]
+    fn test_percent_decode_truncated_at_end() {
+        // trailing %2 with no second hex char
+        assert_eq!(percent_decode("test%2"), "test%2");
+    }
+
+    #[test]
+    fn test_percent_decode_bare_percent() {
+        assert_eq!(percent_decode("test%"), "test%");
     }
 }

@@ -1,15 +1,9 @@
-mod cli;
-mod chunk;
-mod config;
-mod inspect;
-mod parallel;
-mod queue;
-mod range_download;
-mod resume;
-mod retry;
-mod scrape;
-mod signal;
-mod sync;
+use rdm::cli;
+use rdm::config;
+use rdm::queue;
+use rdm::scrape;
+use rdm::signal;
+use rdm::sync;
 
 use anyhow::Result;
 use std::collections::HashSet;

@@ -13,33 +13,42 @@ use crate::range_download::{self, DownloadStatus};
 use crate::resume::{self, ResumeMetadata};
 use crate::retry::{self, RetryConfig};
 
+/// Groups all parameters needed for a parallel download session.
+pub struct ParallelDownloadCtx<'a> {
+    pub client: &'a Client,
+    pub url: &'a str,
+    pub output_path: &'a str,
+    pub file_size: u64,
+    pub chunks: &'a [Chunk],
+    pub retry_config: &'a RetryConfig,
+    pub cancel: CancellationToken,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
 pub async fn download_parallel<F>(
-    client: &Client,
-    url: &str,
-    output_path: &str,
-    file_size: u64,
-    chunks: &[Chunk],
-    retry_config: &RetryConfig,
+    ctx: &ParallelDownloadCtx<'_>,
     progress_callback: Option<F>,
-    cancel: CancellationToken,
-    etag: Option<String>,
-    last_modified: Option<String>,
 ) -> Result<u64>
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    if chunks.is_empty() {
+    if ctx.chunks.is_empty() {
         anyhow::bail!("No chunks provided for parallel download");
     }
 
-    let temp_path = format!("{}.part", output_path);
-    let meta_path = ResumeMetadata::meta_path(output_path);
+    let temp_path = format!("{}.part", ctx.output_path);
+    let meta_path = ResumeMetadata::meta_path(ctx.output_path);
 
-    match parallel_inner(client, url, &temp_path, &meta_path, file_size, chunks, retry_config, progress_callback, cancel, etag, last_modified).await {
+    match parallel_inner(
+        ctx.client, ctx.url, &temp_path, &meta_path, ctx.file_size,
+        ctx.chunks, ctx.retry_config, progress_callback, ctx.cancel.clone(),
+        ctx.etag.clone(), ctx.last_modified.clone(),
+    ).await {
         Ok(total) => {
             resume::delete(&meta_path).await?;
-            fs::rename(&temp_path, output_path).await
-                .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))?;
+            fs::rename(&temp_path, ctx.output_path).await
+                .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path))?;
             Ok(total)
         }
         Err(e) => Err(e),
@@ -112,7 +121,6 @@ where
     let initial_completed: u64 =
         chunk_counters.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
 
-    let global_progress = Arc::new(AtomicU64::new(initial_completed));
     let retry_pressure = Arc::new(AtomicUsize::new(0));
     let done_flag = Arc::new(AtomicBool::new(false));
 
@@ -145,7 +153,6 @@ where
             let client = client.clone();
             let url = url.to_string();
             let path = temp_path.to_string();
-            let gp = Arc::clone(&global_progress);
             let cancel = cancel.clone();
             let config = retry_config.clone();
             let chunk_progress = chunk_counters
@@ -165,7 +172,6 @@ where
                     &chunk,
                     &config,
                     chunk_progress,
-                    gp,
                     cancel,
                 )
                 .await
@@ -185,7 +191,7 @@ where
         if retry_pressure.load(Ordering::Relaxed) >= active_workers * 2 && active_workers > 1 {
             let new = (active_workers / 2).max(1);
             eprintln!(
-                "  ⚠ Server overloaded — reducing parallel connections: {} → {}",
+                "  \u{26a0} Server overloaded \u{2014} reducing parallel connections: {} \u{2192} {}",
                 active_workers, new
             );
             active_workers = new;
@@ -298,7 +304,7 @@ fn spawn_autosave(
 
 async fn download_chunk_with_retry(
     client: &Client, url: &str, file_path: &str, chunk: &Chunk, config: &RetryConfig,
-    chunk_progress: Arc<AtomicU64>, global_progress: Arc<AtomicU64>, cancel: CancellationToken,
+    chunk_progress: Arc<AtomicU64>, cancel: CancellationToken,
 ) -> Result<u64> {
     let full_chunk_size = chunk.end - chunk.start + 1;
     let initial_completed = chunk_progress.load(Ordering::SeqCst);
@@ -314,7 +320,7 @@ async fn download_chunk_with_retry(
 
         match range_download::download_range(
             client, url, file_path, chunk.start, chunk.end, resume_from,
-            Arc::clone(&chunk_progress), Some(Arc::clone(&global_progress)), cancel.clone(),
+            Arc::clone(&chunk_progress), cancel.clone(),
         ).await {
             // FIX 3: Report only bytes written during this invocation
             Ok(DownloadStatus::Complete { bytes_written: _ }) => {
@@ -329,20 +335,18 @@ async fn download_chunk_with_retry(
             Err(e) if e.root_cause().to_string().contains("does not support range requests")
                     && attempt < config.max_retries =>
                 {
-                    let old = chunk_progress.swap(0, Ordering::SeqCst);
-                    global_progress.fetch_sub(old, Ordering::Relaxed);
+                    chunk_progress.store(0, Ordering::SeqCst);
                     eprintln!(
-                        "   ⚠ Chunk #{}: range not supported, restarting from byte 0",
+                        "   \u{26a0} Chunk #{}: range not supported, restarting from byte 0",
                         chunk.id,
                     );
                     continue;
                 }
 
             Err(e) if retry::is_retryable(&e) && attempt < config.max_retries => {
-                let written = chunk_progress.load(Ordering::SeqCst);
                 let delay = config.delay_for_attempt(attempt);
                 eprintln!(
-    "   ⚠ Chunk #{}: {}/{} failed, retry in {:.1}s — {}",
+    "   \u{26a0} Chunk #{}: {}/{} failed, retry in {:.1}s \u{2014} {}",
                     chunk.id, attempt + 1, config.max_retries + 1,
                     delay.as_secs_f64(),
                     short_error(&e),
@@ -378,7 +382,7 @@ fn short_error(err: &anyhow::Error) -> String {
         while end > 0 && !msg.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}…", &msg[..end])
+        format!("{}\u{2026}", &msg[..end])
     } else {
         msg
     }

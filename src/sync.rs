@@ -357,17 +357,6 @@ fn file_has_ext(filename: &str, exts: &HashSet<String>) -> bool {
     exts.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
 }
 
-fn find_existing(paths: &[PathBuf]) -> Option<(PathBuf, u64)> {
-    for path in paths {
-        if let Ok(m) = std::fs::metadata(path) {
-            if m.is_file() {
-                return Some((path.clone(), m.len()));
-            }
-        }
-    }
-    None
-}
-
 async fn head_compare(
     client: &reqwest::Client,
     url: &str,

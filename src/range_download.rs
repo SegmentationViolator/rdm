@@ -24,7 +24,6 @@ pub async fn download_range(
     end: u64,
     resume_from: u64,
     chunk_progress: Arc<AtomicU64>,
-    global_progress: Option<Arc<AtomicU64>>,
     cancel: CancellationToken,
 ) -> Result<DownloadStatus> {
     if end < start {
