@@ -72,7 +72,7 @@
                         cargoArtifacts = mingwCargoArtifacts;
                         CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
                         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER =
-                            "${pkgs.stdenv.cc.targetPrefix}gcc";
+                            "${mingwPkgs.stdenv.cc.targetPrefix}gcc";
                     }
                 );
             in
